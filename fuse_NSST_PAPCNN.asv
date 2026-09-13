@@ -1,0 +1,78 @@
+function F = fuse_NSST_PAPCNN(A,B)
+% NSST + PAPCNN (low-freq) + Rolling Guidance Filter (high-freq) fusion.
+% Robust for any image size (odd or even).
+%
+%   Low-frequency (approximation) coefficients -> PAPCNN_Fusion
+%   High-frequency (detail) subbands           -> RGF_Fusion
+%                                                  (rolling-guidance
+%                                                   edge-preserving fusion)
+
+%% Step 1 — Force even dimensions
+[m, n] = size(A);
+m2 = floor(m/2)*2;
+n2 = floor(n/2)*2;
+if m ~= m2 || n ~= n2
+    A = imresize(A, [m2 n2]);
+    B = imresize(B, [m2 n2]);
+end
+
+%% Step 2 — NSST decomposition parameters
+pfilt = 'maxflat';
+shear_parameters.dcomp = [2, 2, 3];   % safer for 256x256 or smaller
+shear_parameters.dsize = [8, 8, 16];
+
+%% Step 3 — NSST decomposition
+[y1, shear_f1] = nsst_dec2(A, shear_parameters, pfilt);
+[y2, ~]        = nsst_dec2(B, shear_parameters, pfilt);
+
+%% Step 4 — Fusion rules
+y = y1;
+
+% Low-frequency: adaptive PAPCNN-based fusion (replaces plain averaging)
+y{1} = PAPCNN_Fusion(y1{1}, y2{1});
+
+% High-frequency: Rolling Guidance Filter fusion per directional subband
+for m = 2:length(shear_parameters.dcomp)+1
+    temp = size(y1{m},3);
+    for n = :temp
+        Ahigh = y1{m}(:,:,n);
+        Bhigh = y2{m}(:,:,n);
+        % Handle any mismatch before fusion
+        [r1,c1] = size(Ahigh);
+        [r2,c2] = size(Bhigh);
+        if r1 ~= r2 || c1 ~= c2
+            Ahigh = imresize(Ahigh, [min(r1,r2) min(c1,c2)]);
+            Bhigh = imresize(Bhigh, [min(r1,r2) min(c1,c2)]);
+        end
+
+        % Rolling-guidance-filtered versions act as the edge-aware guide
+        guideA = rollingGuidanceFilter(Ahigh);
+        guideB = rollingGuidanceFilter(Bhigh);
+        Iguide = (guideA + guideB) / 2;
+
+        y{m}(:,:,n) = RGF_Fusion(Ahigh, Bhigh, Iguide);
+    end
+end
+
+%% Step 5 — NSST reconstruction (auto-size correction)
+try
+    F = nsst_rec2(y, shear_f1, pfilt);
+catch
+    % If dimension mismatch persists, resize all subbands to match lowest size
+    minr = min(cellfun(@(c) size(c,1), y));
+    minc = min(cellfun(@(c) size(c,2), y));
+    for m = 1:length(y)
+        if ndims(y{m}) == 2
+            y{m} = imresize(y{m}, [minr minc]);
+        else
+            numBands = size(y{m},3);
+            newStack = zeros(minr, minc, numBands);
+            for k = 1:numBands
+                newStack(:,:,k) = imresize(y{m}(:,:,k), [minr minc]);
+            end
+            y{m} = newStack;
+        end
+    end
+    F = nsst_rec2(y, shear_f1, pfilt);
+end
+end
